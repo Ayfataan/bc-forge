@@ -2,6 +2,12 @@ import { rpc as SorobanRpc, xdr, scValToNative } from '@stellar/stellar-sdk';
 import { PrismaClient } from '@prisma/client';
 import dotenv from 'dotenv';
 import { publishIndexerEvent } from './events';
+import {
+  hasContinuousParentChain,
+  reconcileLedgerCursor,
+  seedLedgerCheckpoints,
+  toLedgerCoordinate,
+} from './cursor';
 
 dotenv.config();
 
@@ -24,12 +30,21 @@ export async function runIndexer() {
 
   // 1. Get the last indexed ledger
   let lastLedger = await prisma.lastIndexedLedger.findUnique({ where: { id: 1 } });
-  let startLedger = lastLedger ? lastLedger.ledger + 1 : 0;
+  if (lastLedger) {
+    await seedLedgerCheckpoints(prisma, server, lastLedger);
+  }
+  let startLedger = lastLedger ? lastLedger.ledger + 1 : 1;
 
   // 2. Continuous loop
   while (true) {
     try {
       const currentLedger = (await server.getLatestLedger()).sequence;
+
+      lastLedger = await prisma.lastIndexedLedger.findUnique({ where: { id: 1 } });
+      if (lastLedger) {
+        const reconciledLedger = await reconcileLedgerCursor(prisma, server, lastLedger);
+        startLedger = reconciledLedger + 1;
+      }
       
       if (startLedger > currentLedger) {
         // Wait for new ledgers
@@ -37,11 +52,40 @@ export async function runIndexer() {
         continue;
       }
 
-      const endLedger = Math.min(startLedger + 1000, currentLedger);
+      const endLedger = Math.min(startLedger + 999, currentLedger);
       console.log(`Indexing ledgers: ${startLedger} to ${endLedger}`);
+
+      const ledgerStart = Math.max(1, startLedger - 1);
+      const ledgerResponse = await server.getLedgers({
+        startLedger: ledgerStart,
+        pagination: { limit: endLedger - ledgerStart + 1 },
+      });
+      const coordinates = ledgerResponse.ledgers
+        .filter((ledger) => ledger.sequence >= startLedger && ledger.sequence <= endLedger)
+        .map(toLedgerCoordinate);
+      const previousCoordinate = lastLedger?.ledger === startLedger - 1 && lastLedger.hash
+        ? {
+            ledger: lastLedger.ledger,
+            hash: lastLedger.hash,
+            parentHash: lastLedger.parentHash ?? '',
+          }
+        : ledgerResponse.ledgers
+            .filter((ledger) => ledger.sequence === startLedger - 1)
+            .map(toLedgerCoordinate)[0];
+
+      if (
+        coordinates.length !== endLedger - startLedger + 1 ||
+        !hasContinuousParentChain(coordinates, previousCoordinate)
+      ) {
+        if (lastLedger) {
+          await reconcileLedgerCursor(prisma, server, lastLedger);
+        }
+        throw new Error(`Ledger sequence or parent hash mismatch at ${startLedger}`);
+      }
 
       const response = await server.getEvents({
         startLedger: startLedger,
+        endLedger,
         filters: [
           {
             type: 'contract',
@@ -54,12 +98,20 @@ export async function runIndexer() {
         await processEvent(event);
       }
 
-      // Update last indexed ledger
-      await prisma.lastIndexedLedger.upsert({
-        where: { id: 1 },
-        update: { ledger: endLedger },
-        create: { id: 1, ledger: endLedger },
-      });
+      const latestCoordinate = coordinates[coordinates.length - 1];
+      if (!latestCoordinate) throw new Error(`No ledger coordinates returned through ${endLedger}`);
+      await prisma.$transaction([
+        prisma.indexedLedger.createMany({ data: coordinates, skipDuplicates: true }),
+        prisma.lastIndexedLedger.upsert({
+          where: { id: 1 },
+          update: {
+            ledger: latestCoordinate.ledger,
+            hash: latestCoordinate.hash,
+            parentHash: latestCoordinate.parentHash,
+          },
+          create: { id: 1, ...latestCoordinate },
+        }),
+      ]);
 
       startLedger = endLedger + 1;
 
@@ -72,7 +124,10 @@ export async function runIndexer() {
   }
 }
 
-async function processEvent(event: SorobanRpc.Api.EventResponse) {
+export async function processEvent(
+  event: SorobanRpc.Api.EventResponse,
+  database: PrismaClient = prisma,
+) {
   if (!event.topic || event.topic.length === 0) return;
   const topic = scValToNative(event.topic[0] as any);
   const data = event.value as any;
@@ -89,7 +144,7 @@ async function processEvent(event: SorobanRpc.Api.EventResponse) {
       case 'mint': {
         const decoded = scValToNative(data as any);
         // (admin, to, amount, new_balance, new_supply, version)
-        const row = await prisma.mint.create({
+        const row = await database.mint.create({
           data: {
             to: decoded[1],
             amount: decoded[2].toString(),
@@ -103,7 +158,7 @@ async function processEvent(event: SorobanRpc.Api.EventResponse) {
       case 'burn': {
         const decoded = scValToNative(data as any);
         // (from, amount, new_balance, new_supply, version)
-        const row = await prisma.burn.create({
+        const row = await database.burn.create({
           data: {
             from: decoded[0],
             amount: decoded[1].toString(),
@@ -117,7 +172,7 @@ async function processEvent(event: SorobanRpc.Api.EventResponse) {
       case 'xfer': {
         const decoded = scValToNative(data as any);
         // (from, to, amount, version)
-        const row = await prisma.transfer.create({
+        const row = await database.transfer.create({
           data: {
             from: decoded[0],
             to: decoded[1],
@@ -132,7 +187,7 @@ async function processEvent(event: SorobanRpc.Api.EventResponse) {
       case 'xfer_frm': {
         const decoded = scValToNative(data as any);
         // (spender, from, to, amount, remaining_allowance, version)
-        const row = await prisma.transfer.create({
+        const row = await database.transfer.create({
           data: {
             from: decoded[1],
             to: decoded[2],

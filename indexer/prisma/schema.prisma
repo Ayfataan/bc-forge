@@ -36,8 +36,16 @@ model Burn {
 }
 
 model LastIndexedLedger {
-  id     Int @id @default(1)
-  ledger Int
+  id         Int     @id @default(1)
+  ledger     Int
+  hash       String?
+  parentHash String?
+}
+
+model IndexedLedger {
+  ledger     Int    @id
+  hash       String @unique
+  parentHash String
 }
 
 model Webhook {
