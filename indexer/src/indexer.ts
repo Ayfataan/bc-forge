@@ -2,6 +2,8 @@ import { rpc as SorobanRpc, xdr, scValToNative } from '@stellar/stellar-sdk';
 import { PrismaClient } from '@prisma/client';
 import dotenv from 'dotenv';
 import { publishIndexerEvent } from './events';
+import { applyLedgerEventAggregates, type AggregateStore } from './aggregates';
+import type { LedgerEvent } from './ledger';
 import { logger } from './lib/logger';
 import { setLatestNetworkLedger } from './metrics';
 
@@ -36,6 +38,7 @@ export async function runIndexer() {
   while (true) {
     try {
       const currentLedger = (await server.getLatestLedger()).sequence;
+
       setLatestNetworkLedger(currentLedger);
       const lag = Math.max(0, currentLedger - (startLedger - 1));
       if (lag > LAG_THRESHOLD) {
@@ -128,6 +131,54 @@ export async function runIndexer() {
   }
 }
 
+/**
+ * Resolve the ledger close time for an event, falling back to the current
+ * time when the RPC response does not carry a parseable `ledgerClosedAt`.
+ */
+function ledgerCloseTime(event: SorobanRpc.Api.EventResponse): Date {
+  const closedAt = (event as { ledgerClosedAt?: unknown }).ledgerClosedAt;
+  if (typeof closedAt === 'string') {
+    const parsed = new Date(closedAt);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+  return new Date();
+}
+
+/**
+ * Persist an event row and its derived holder/supply aggregates in a single
+ * transaction so a re-index cannot apply an event twice.
+ */
+async function persistEventRow(
+  client: PrismaClient,
+  model: 'mint' | 'transfer' | 'burn',
+  data: Record<string, unknown>,
+  ledgerEvent: LedgerEvent,
+  event: SorobanRpc.Api.EventResponse,
+  newSupply?: string,
+): Promise<unknown> {
+  const run = async (tx: AggregateStore & Record<string, { create: (args: { data: Record<string, unknown> }) => Promise<unknown> }>) => {
+    const created = await (tx as any)[model].create({ data });
+    if (typeof (tx as AggregateStore).holder?.upsert === 'function') {
+      await applyLedgerEventAggregates(tx as unknown as AggregateStore, ledgerEvent, {
+        ledger: event.ledger,
+        txHash: event.txHash,
+        timestamp: ledgerCloseTime(event),
+        newSupply,
+      });
+    }
+    return created;
+  };
+  const transactional = client as PrismaClient & {
+    $transaction?: (fn: (tx: PrismaClient) => Promise<unknown>) => Promise<unknown>;
+  };
+  if (typeof transactional.$transaction === 'function') {
+    return transactional.$transaction((tx) => run(tx as never));
+  }
+  return run(client as never);
+}
+
 export async function processEvent(
   event: SorobanRpc.Api.EventResponse,
   database: PrismaClient = prisma,
@@ -148,58 +199,98 @@ export async function processEvent(
       case 'mint': {
         const decoded = scValToNative(data as any);
         // (admin, to, amount, new_balance, new_supply, version)
-        const row = await database.mint.create({
-          data: {
+        const ledgerEvent: LedgerEvent = {
+          type: 'mint',
+          to: decoded[1],
+          amount: decoded[2].toString(),
+        };
+        const row = await persistEventRow(
+          database,
+          'mint',
+          {
             to: decoded[1],
             amount: decoded[2].toString(),
             ledger: event.ledger,
             txHash: event.txHash,
           },
-        });
+          ledgerEvent,
+          event,
+          decoded[4]?.toString(),
+        );
         publishIndexerEvent({ type: 'mint', data: row as unknown as Record<string, unknown> });
         break;
       }
       case 'burn': {
         const decoded = scValToNative(data as any);
         // (from, amount, new_balance, new_supply, version)
-        const row = await database.burn.create({
-          data: {
+        const ledgerEvent: LedgerEvent = {
+          type: 'burn',
+          from: decoded[0],
+          amount: decoded[1].toString(),
+        };
+        const row = await persistEventRow(
+          database,
+          'burn',
+          {
             from: decoded[0],
             amount: decoded[1].toString(),
             ledger: event.ledger,
             txHash: event.txHash,
           },
-        });
+          ledgerEvent,
+          event,
+          decoded[3]?.toString(),
+        );
         publishIndexerEvent({ type: 'burn', data: row as unknown as Record<string, unknown> });
         break;
       }
       case 'xfer': {
         const decoded = scValToNative(data as any);
         // (from, to, amount, version)
-        const row = await database.transfer.create({
-          data: {
+        const ledgerEvent: LedgerEvent = {
+          type: 'transfer',
+          from: decoded[0],
+          to: decoded[1],
+          amount: decoded[2].toString(),
+        };
+        const row = await persistEventRow(
+          database,
+          'transfer',
+          {
             from: decoded[0],
             to: decoded[1],
             amount: decoded[2].toString(),
             ledger: event.ledger,
             txHash: event.txHash,
           },
-        });
+          ledgerEvent,
+          event,
+        );
         publishIndexerEvent({ type: 'transfer', data: row as unknown as Record<string, unknown> });
         break;
       }
       case 'xfer_frm': {
         const decoded = scValToNative(data as any);
         // (spender, from, to, amount, remaining_allowance, version)
-        const row = await database.transfer.create({
-          data: {
+        const ledgerEvent: LedgerEvent = {
+          type: 'transfer',
+          from: decoded[1],
+          to: decoded[2],
+          amount: decoded[3].toString(),
+        };
+        const row = await persistEventRow(
+          database,
+          'transfer',
+          {
             from: decoded[1],
             to: decoded[2],
             amount: decoded[3].toString(),
             ledger: event.ledger,
             txHash: event.txHash,
           },
-        });
+          ledgerEvent,
+          event,
+        );
         publishIndexerEvent({ type: 'transfer', data: row as unknown as Record<string, unknown> });
         break;
       }
